@@ -168,9 +168,11 @@ def split_into_windows(start_time: datetime, end_time: datetime, minutes: int) -
 observation의 tags는 Langfuse 데이터 모델상 **observation에 설정된 tags가 상위 trace로 집계**되는 구조이며, v1 Observations API 응답(`GET /api/public/observations`)에는 tags 필드가 직접 포함되지 않을 수 있다. 따라서 다음 2단계 방식으로 필터링한다.
 
 1. **Trace 조회**: `GET /api/public/traces`를 `tags=["project:1"]`, 윈도우의 시간 범위(trace 타임스탬프 기준 파라미터, 예: `fromTimestamp`/`toTimestamp`)로 호출하여, 해당 윈도우 내 `'project:1'` 태그가 포함된 trace ID 목록을 페이지네이션으로 전체 수집한다.
-2. **Observation 조회**: 수집된 각 `traceId`에 대해 `GET /api/public/observations`를 `traceId=<id>`, `type=GENERATION`, **그리고 1단계와 동일한 윈도우의 `fromStartTime`/`toStartTime`**을 함께 지정하여 조회한다.
+2. **Observation 조회**: `GET /api/public/observations`를 `type=GENERATION`, **1단계와 동일한 윈도우의 `fromStartTime`/`toStartTime`**으로 — **`traceId`는 지정하지 않고 윈도우 전체를 한 번(페이지네이션 포함)만** 조회한다. 응답으로 받은 observation 중 `traceId`가 1단계에서 수집한 trace ID 집합에 속하는 것만 클라이언트 사이드에서 필터링해 적재 대상으로 남긴다.
 
-> ⚠️ **시간 필터를 observation 조회에도 반드시 적용하는 이유**: trace 하나가 여러 10분 윈도우에 걸쳐 지속되며 여러 generation을 가질 수 있다. 1단계에서 trace는 자신의 타임스탬프가 속한 단일 윈도우에서만 매칭되므로, 2단계에서 `traceId`만으로 조회하면 **그 trace에 속한, 현재 윈도우 밖의 observation까지 함께 적재**되어 §5.1이 정한 윈도우별 반개구간 처리 원칙이 깨진다. 따라서 2단계 조회에도 동일한 `fromStartTime`/`toStartTime`을 반드시 지정해 해당 윈도우에서 시작된 observation만 가져온다.
+> ⚠️ **시간 필터를 observation 조회에도 반드시 적용하는 이유**: trace 하나가 여러 윈도우에 걸쳐 지속되며 여러 generation을 가질 수 있다. 1단계에서 trace는 자신의 타임스탬프가 속한 단일 윈도우에서만 매칭되므로, 2단계 조회에 시간 필터가 없으면 다른 윈도우 시간대의 observation까지 함께 적재되어 §5.1이 정한 윈도우별 반개구간 처리 원칙이 깨진다.
+>
+> ⚡ **성능 관련 설계 결정**: 최초 설계는 2단계에서 1단계가 찾은 trace마다 `traceId=<id>`로 개별 호출하는 방식이었으나(trace 수만큼 API 왕복 발생, N+1 패턴), 실측 결과 이 부분이 배치 실행 시간의 주요 병목이었다. v1 Observations API가 `traceId` 없이도 `type`+시간 범위만으로 조회 가능함을 이용해, **윈도우당 observation 조회를 1회(페이지네이션 포함)로 축소**하고 tags 매칭 여부는 trace ID 집합으로 사후 필터링하는 방식으로 변경했다. `'project:1'` 태그 트래픽이 전체 GENERATION 대비 극히 적은 비중이라면 불필요한 데이터 다운로드가 늘어나는 트레이드오프가 있을 수 있으므로, 실제 운영 로그의 조회 소요시간을 보고 필요하면 재검토한다.
 
 > ⚠️ **오픈 이슈**: v1 `traces` API의 `tags` 파라미터명/문법과, v1 `observations` API가 `filter`(JSON 기반 advanced filtering) 파라미터로 tags를 직접 지원하는지 여부는 실제 API 레퍼런스(`api.reference.langfuse.com`)로 최종 확인이 필요하다. 만약 v1 observations가 tags 직접 필터를 지원한다면 1단계(trace 조회)를 생략하고 단일 호출로 단순화할 수 있다(§13 오픈 이슈 3).
 

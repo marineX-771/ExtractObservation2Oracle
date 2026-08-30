@@ -447,23 +447,30 @@ def _get_observations_v1_client(client: Langfuse) -> Any:
     return client.api.observations  # langfuse SDK < 4.0 (v1이 기본 경로였음)
 
 
-def fetch_observations(
-    client: Langfuse, trace_id: str, window_start_utc: datetime, window_end_utc: datetime
+def fetch_window_observations(
+    client: Langfuse, window_start_utc: datetime, window_end_utc: datetime
 ) -> list[Any]:
-    """지정 trace의 GENERATION observation을 윈도우 시간 범위 내에서 조회한다. (design.md §5.2 2단계)
+    """윈도우 시간 범위 내 GENERATION observation을 '한 번에' 조회한다. (design.md §5.2 2단계)
 
-    2단계 조회에도 윈도우 시간(fromStartTime/toStartTime)을 반드시 함께 지정한다 —
-    그렇지 않으면 trace에 속한 다른 윈도우 시간대의 observation까지 함께 적재되어
-    윈도우별 반개구간 처리 원칙이 깨진다. (design.md §5.2 경고 참고)
+    성능 튜닝: 이전 구현은 tags 매칭 trace마다 observations API를 개별 호출했다
+    (trace가 N개면 HTTP 왕복 N번, N+1 패턴). v1 Observations API는 trace_id 없이도
+    type/from_start_time/to_start_time만으로 조회가 가능하므로, 윈도우 전체를
+    한 번(페이지네이션 포함)만 조회하고, tags 매칭 여부는 호출부에서 trace_id
+    집합으로 클라이언트 사이드 필터링한다. 이렇게 하면 observation 조회 API
+    호출 횟수가 "매칭 trace 수"가 아니라 "윈도우당 페이지 수"로 줄어든다.
+
+    ⚠️ tags='project:1' 트래픽이 해당 프로젝트의 전체 GENERATION 대비 매우 낮은
+    비중이라면, 오히려 불필요한 데이터를 더 많이 내려받는 트레이드오프가 생길 수
+    있다. 그 경우 이전 방식(trace별 조회)이 나을 수도 있으니 §11 로그의
+    "조회 %.1f초" 값으로 실측 후 판단한다.
     """
     observations_client = _get_observations_v1_client(client)
     observations: list[Any] = []
     page = 1
     while True:
         response = with_retries(
-            f"observations 조회(trace_id={trace_id}, page={page})",
+            f"observations 조회(window={window_start_utc}~{window_end_utc}, page={page})",
             observations_client.get_many,
-            trace_id=trace_id,
             type=OBSERVATION_TYPE,
             from_start_time=window_start_utc,
             to_start_time=window_end_utc,
@@ -535,22 +542,50 @@ def process_window(
 
     LOG.info("윈도우 처리 시작: %s ~ %s (KST)", window_start_kst, window_end_kst)
 
+    # 구간별 소요시간을 로그로 남겨, 이후 느려질 경우 어느 단계(trace 조회 /
+    # observation 조회 / DB 적재)가 원인인지 바로 진단할 수 있게 한다.
+    t0 = time.monotonic()
     trace_ids = fetch_trace_ids(client, window_start_utc, window_end_utc)
-    LOG.info("  tags='%s' 매칭 trace 수: %d", TAG_FILTER, len(trace_ids))
+    t1 = time.monotonic()
+    LOG.info(
+        "  tags='%s' 매칭 trace 수: %d (trace 조회 %.1f초)",
+        TAG_FILTER, len(trace_ids), t1 - t0,
+    )
+
+    if not trace_ids:
+        LOG.info("  매칭 trace 없음 — observation 조회 생략")
+        return 0, 0
+    trace_id_set = set(trace_ids)
+
+    t2 = time.monotonic()
+    observations = fetch_window_observations(client, window_start_utc, window_end_utc)
+    t3 = time.monotonic()
+    LOG.info(
+        "  윈도우 내 GENERATION observation 조회: %d건 (observation 조회 %.1f초)",
+        len(observations), t3 - t2,
+    )
 
     rows: list[dict] = []
     skipped = 0
-    for trace_id in trace_ids:
-        observations = fetch_observations(client, trace_id, window_start_utc, window_end_utc)
-        for observation in observations:
-            row = safe_transform(observation)
-            if row is None:
-                skipped += 1
-            else:
-                rows.append(row)
+    filtered_out = 0
+    for observation in observations:
+        obs_trace_id = _get(observation, "trace_id") or _get(observation, "traceId")
+        if obs_trace_id not in trace_id_set:
+            filtered_out += 1  # tags='project:1' 미매칭 trace 소속 → 대상 아님
+            continue
+        row = safe_transform(observation)
+        if row is None:
+            skipped += 1
+        else:
+            rows.append(row)
 
+    t4 = time.monotonic()
     merge_rows(connection, rows)
-    LOG.info("  적재 완료: %d건 (스킵 %d건)", len(rows), skipped)
+    t5 = time.monotonic()
+    LOG.info(
+        "  적재 완료: %d건 (tags 미매칭 제외 %d건, 스킵 %d건, DB 적재 %.1f초)",
+        len(rows), filtered_out, skipped, t5 - t4,
+    )
     return len(rows), skipped
 
 
