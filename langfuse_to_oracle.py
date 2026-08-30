@@ -431,6 +431,22 @@ def fetch_trace_ids(client: Langfuse, window_start_utc: datetime, window_end_utc
     return trace_ids
 
 
+def _get_observations_v1_client(client: Langfuse) -> Any:
+    """v1 Observations API 클라이언트를 SDK 버전에 상관없이 찾아 반환한다.
+
+    langfuse SDK 4.x부터 v1 엔드포인트가 `client.api.legacy.observations_v1`로
+    이동했다(`client.api.observations`는 v2로 바뀌어 `page` 대신 `cursor`
+    기반 페이지네이션을 사용하므로 그대로 쓰면 `unexpected keyword argument
+    'page'` 오류가 난다). 4.x 이전 SDK에서는 `client.api.observations` 자체가
+    v1이었으므로 그 경로로 폴백한다.
+    """
+    legacy = getattr(client.api, "legacy", None)
+    observations_v1 = getattr(legacy, "observations_v1", None) if legacy else None
+    if observations_v1 is not None:
+        return observations_v1
+    return client.api.observations  # langfuse SDK < 4.0 (v1이 기본 경로였음)
+
+
 def fetch_observations(
     client: Langfuse, trace_id: str, window_start_utc: datetime, window_end_utc: datetime
 ) -> list[Any]:
@@ -440,12 +456,13 @@ def fetch_observations(
     그렇지 않으면 trace에 속한 다른 윈도우 시간대의 observation까지 함께 적재되어
     윈도우별 반개구간 처리 원칙이 깨진다. (design.md §5.2 경고 참고)
     """
+    observations_client = _get_observations_v1_client(client)
     observations: list[Any] = []
     page = 1
     while True:
         response = with_retries(
             f"observations 조회(trace_id={trace_id}, page={page})",
-            client.api.observations.get_many,
+            observations_client.get_many,
             trace_id=trace_id,
             type=OBSERVATION_TYPE,
             from_start_time=window_start_utc,
