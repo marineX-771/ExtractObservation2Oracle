@@ -18,7 +18,7 @@ Langfuse(v3.194.1)의 observation 데이터를 추출하여 Oracle DB의 TRX_TOK
     ORACLE_DSN, ORACLE_USER, ORACLE_PASSWORD
     WINDOW_MINUTES (선택, 기본값 10)
 
-필요 패키지: langfuse, oracledb, python-dotenv (README.md 참고)
+필요 패키지: langfuse, oracledb, python-dotenv, tzdata(Windows 필수) — README.md 참고
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
@@ -60,8 +60,15 @@ USER_ID_FIXED = "TBD"             # 요구사항 고정값
 TAG_FILTER = "project:1"          # observation(trace) tags 필터
 OBSERVATION_TYPE = "GENERATION"   # 토큰 사용량이 존재하는 타입만 대상
 
-KST = ZoneInfo("Asia/Seoul")
-UTC = ZoneInfo("UTC")
+try:
+    KST = ZoneInfo("Asia/Seoul")
+    UTC = ZoneInfo("UTC")
+except ZoneInfoNotFoundError as exc:  # pragma: no cover
+    # Windows는 OS에 IANA 시간대 데이터베이스가 내장되어 있지 않아 발생한다.
+    raise SystemExit(
+        "시간대(Asia/Seoul) 정보를 찾을 수 없습니다. "
+        "Windows에서는 `pip install tzdata`로 시간대 데이터베이스를 설치해야 합니다."
+    ) from exc
 
 QUERY_CTN_MAX_BYTES = 4000        # TRX_TOKEN_DET.QUERY_CTN VARCHAR2(4000)
 ERR_CTN_MAX_BYTES = 1000          # TRX_TOKEN_DET.ERR_CTN VARCHAR2(1000)
